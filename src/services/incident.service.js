@@ -1,6 +1,8 @@
-import { Eleve, Incident } from '../models/index.js'
-import { forbidden, notFound } from '../utils/errors.js'
-import { incidentRefusal, canDeleteIncident } from '../policies/access.js'
+import { Classe, Eleve, Incident } from '../models/index.js'
+import { lockedMessage } from '../utils/locks.js'
+import { audit } from './audit.service.js'
+import { badRequest, forbidden, notFound } from '../utils/errors.js'
+import { incidentRefusal, canDeleteIncident, canJustify } from '../policies/access.js'
 import { findClasse } from './classe.service.js'
 
 export const toDto = i => ({
@@ -20,6 +22,9 @@ export async function create(user, eleveId, data) {
   if (refus) throw forbidden(refus)
 
   const t = data.type
+  // une pénalité modifie les moyennes : impossible sur un trimestre verrouillé
+  if (t === 'penalite' && classe.locked?.[data.tr]) throw forbidden(lockedMessage(classe, data.tr))
+  if (t === 'penalite' || t === 'sanction') await audit(user, t, { classe: classe._id, eleve: eleve._id, detail: { tr: data.tr, points: data.points, label: data.label, motif: data.motif, matiere: matiere?.name } })
   const doc = await Incident.create({
     school: user.school, classe: classe._id, eleve: eleve._id, tr: data.tr, type: t,
     date: data.date ? new Date(data.date) : new Date(),
@@ -34,10 +39,25 @@ export async function create(user, eleveId, data) {
   return toDto(doc)
 }
 
+// L'administration justifie (ou annule la justification d') une absence, par exemple à réception d'un certificat
+export async function update(user, id, { justified }) {
+  if (!canJustify(user)) throw forbidden('Seule l’administration justifie les absences')
+  const inc = await Incident.findOne({ _id: id, school: user.school })
+  if (!inc) throw notFound('Événement introuvable')
+  if (inc.type !== 'absence') throw badRequest('Seules les absences peuvent être justifiées')
+  await audit(user, 'absence_justifiee', { classe: inc.classe, eleve: inc.eleve, detail: { tr: inc.tr, heures: inc.hours, de: inc.justified, a: justified } })
+  inc.justified = justified
+  await inc.save()
+  return toDto(inc)
+}
+
 export async function remove(user, id) {
   const inc = await Incident.findOne({ _id: id, school: user.school })
   if (!inc) throw notFound('Événement introuvable')
   if (!canDeleteIncident(user, inc)) throw forbidden('Vous ne pouvez supprimer que vos propres signalements')
+  const classe = await Classe.findById(inc.classe)
+  if (inc.type === 'penalite' && classe?.locked?.[inc.tr]) throw forbidden(lockedMessage(classe, inc.tr))
+  await audit(user, 'incident_supprime', { classe: inc.classe, eleve: inc.eleve, detail: { type: inc.type, tr: inc.tr, points: inc.points, label: inc.label, motif: inc.motif, par: inc.byName } })
   await inc.deleteOne()
 }
 

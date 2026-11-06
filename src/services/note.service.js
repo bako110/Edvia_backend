@@ -1,6 +1,8 @@
 import { Eleve, Classe, User } from '../models/index.js'
 import { forbidden, notFound } from '../utils/errors.js'
 import { canEnterNote } from '../policies/access.js'
+import { lockedMessage } from '../utils/locks.js'
+import { audit } from './audit.service.js'
 
 const COLS = ['d1', 'd2', 'c']   // liste blanche : aucune valeur client n'entre dans un nom de champ
 
@@ -12,7 +14,12 @@ export async function set(user, { eleveId, matiereId, tr, k, value }) {
   const matiere = classe.matieres.id(matiereId)
   if (!matiere) throw notFound('Matière introuvable pour cette classe')
   if (!canEnterNote(user, matiere)) throw forbidden(`Vous n’enseignez pas « ${matiere.name} » dans cette classe`)
+  if (classe.locked?.[tr]) throw forbidden(lockedMessage(classe, tr))   // même l'administrateur doit d'abord déverrouiller (et c'est journalisé)
   const path = `notes.${tr}.${matiere.id}`
+  // traçabilité : ancienne et nouvelle valeur, auteur, date, adresse — écrites AVANT la modification (sans trace, pas de modification)
+  const cur = (await Eleve.findById(eleve._id).select(path).lean())?.notes?.[tr]?.[matiere.id] || {}
+  const from = cur[COLS[k]] ?? ''
+  if (from !== value) await audit(user, 'note', { classe: classe._id, eleve: eleve._id, detail: { matiere: matiere.name, tr, colonne: COLS[k], de: from, a: value } })
   await Eleve.updateOne({ _id: eleve._id }, { $set: { [`${path}.${COLS[k]}`]: value, [`${path}.by`]: user._id, [`${path}.at`]: new Date() } })
   return { value }
 }
@@ -23,7 +30,7 @@ export async function set(user, { eleveId, matiereId, tr, k, value }) {
  */
 export async function status(user, tr) {
   const [classes, eleves, users] = await Promise.all([
-    Classe.find({ school: user.school }).sort('name'),
+    Classe.find({ school: user.school, annee: user.annee }).sort('name'),
     Eleve.find({ school: user.school }).select(`classe notes.${tr}`).lean(),
     User.find({ school: user.school }).select('name active'),
   ])

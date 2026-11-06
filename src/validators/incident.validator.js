@@ -3,6 +3,8 @@ import { objectId, optionalText } from './common.js'
 
 const TYPES = ['retard', 'absence', 'comportement', 'penalite', 'sanction']
 
+export const justifyBody = z.object({ justified: z.boolean({ required_error: 'Indiquez si l’absence est justifiée', invalid_type_error: 'Valeur invalide' }) })
+
 export const createIncidentBody = z.object({
   tr: z.coerce.number({ invalid_type_error: 'Trimestre invalide' }).int('Trimestre invalide').min(0, 'Trimestre invalide').max(2, 'Trimestre invalide'),
   type: z.enum(TYPES, { errorMap: () => ({ message: 'Type d’événement invalide' }) }),

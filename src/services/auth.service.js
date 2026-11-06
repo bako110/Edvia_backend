@@ -3,9 +3,12 @@ import { config } from '../config/env.js'
 import { School, User } from '../models/index.js'
 import { conflict, badRequest, forbidden, unauthorized } from '../utils/errors.js'
 import { makeLimiter } from '../utils/loginLimiter.js'
+import crypto from 'node:crypto'
+import { AuditLog } from '../models/index.js'
 
-const limiter = makeLimiter()
-const sign = user => jwt.sign({ uid: user.id }, config.jwtSecret, { expiresIn: config.jwtExpires })
+const limiter = makeLimiter()                          // par adresse IP + identifiant
+const accountLimiter = makeLimiter(25, 15 * 60 * 1000) // par identifiant, quelle que soit l'adresse (attaque répartie)
+const sign = user => jwt.sign({ uid: user.id, tv: user.tokenVersion || 0 }, config.jwtSecret, { expiresIn: config.jwtExpires })
 const session = (user, school) => ({ token: sign(user), user, school })
 
 // Nouvel établissement + son compte administrateur
@@ -25,12 +28,17 @@ export async function register({ school, name, login, password }) {
 
 export async function login(ip, { login, password }) {
   const key = `${ip}|${login}`
-  limiter.check(key)
+  limiter.check(key); accountLimiter.check(login)
   const user = await User.findOne({ login }).select('+salt +hash')
-  // même message pour « inconnu » et « mauvais mot de passe »
-  if (!user || !user.checkPassword(password)) { limiter.fail(key); throw unauthorized('Identifiant ou mot de passe incorrect') }
+  // même message ET même durée pour « inconnu » et « mauvais mot de passe » (on ne révèle pas quels comptes existent)
+  if (!user) crypto.scryptSync(String(password), 'edvia-dummy-salt-0000000000000000', 64)
+  if (!user || !user.checkPassword(password)) {
+    limiter.fail(key); accountLimiter.fail(login)
+    if (user) await AuditLog.create({ school: user.school, by: user._id, byName: user.name, role: user.role, ip, action: 'connexion_echec', detail: {} })
+    throw unauthorized('Identifiant ou mot de passe incorrect')
+  }
   if (!user.active) throw forbidden('Ce compte est désactivé. Contactez l’administrateur.')
-  limiter.reset(key)
+  limiter.reset(key); accountLimiter.reset(login)
   return session(user, await School.findById(user.school))
 }
 
@@ -43,5 +51,7 @@ export async function changePassword(user, { old, password }) {
   if (!u.checkPassword(old)) throw badRequest('Ancien mot de passe incorrect')
   u.setPassword(password)
   u.mustChange = false
+  u.tokenVersion = (u.tokenVersion || 0) + 1   // tous les anciens jetons (vol, session oubliée) deviennent inutilisables
   await u.save()
+  return { ok: true, token: sign(u) }          // la session en cours continue avec un jeton neuf
 }

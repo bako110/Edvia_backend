@@ -12,8 +12,11 @@ export const optionalText = (name, max = 120) =>
 
 export const loginField = z.string({ required_error: 'Identifiant obligatoire', invalid_type_error: 'Identifiant invalide' })
   .trim().toLowerCase().regex(/^[a-z0-9][a-z0-9._-]{2,31}$/, 'Identifiant : lettres, chiffres, point, tiret ou underscore (3 à 32 caractères)')
+const WEAK = new Set(['motdepasse', 'password', 'password1', '12345678', '123456789', '1234567890', 'azertyuiop', 'azerty123', 'qwertyuiop', 'qwerty123', 'admin1234', 'edvia2026', 'iloveyou1', 'burkina226', 'burkinafaso1'])
 export const passwordField = z.string({ required_error: 'Mot de passe obligatoire', invalid_type_error: 'Mot de passe invalide' })
   .min(8, 'Mot de passe : au moins 8 caractères').max(100, 'Mot de passe : 100 caractères maximum')
+  .refine(v => /[A-Za-z]/.test(v) && /\d/.test(v), 'Mot de passe : au moins une lettre et un chiffre')
+  .refine(v => !WEAK.has(v.toLowerCase()), 'Mot de passe trop courant : choisissez-en un plus difficile à deviner')
 
 export const idParams = z.object({ id: objectId() })
 export const roleField = z.enum(['admin', 'teacher', 'staff'], { errorMap: () => ({ message: 'Rôle invalide' }) })

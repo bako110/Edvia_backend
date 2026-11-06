@@ -30,6 +30,10 @@ export function incidentRefusal(user, classe, type, matiere) {
   if (type === 'penalite' && !(matiere && same(matiere.teacher, user.id))) return 'Vous ne pouvez pénaliser que dans votre propre matière'
   return null
 }
+// Finances, communication avec les parents : administration et personnel administratif.
+// Fixer les frais, annuler un versement, bâtir l'emploi du temps : administrateur seul.
+export const isOffice = user => user.role === 'admin' || user.role === 'staff'
+export const canJustify = isOffice
 export const canDeleteIncident = (user, incident) => user.role === 'admin' || user.role === 'staff' || same(incident.by, user.id)
 export const canWriteObs = (user, classe) => user.role === 'admin' || user.role === 'staff' || isPrincipal(user, classe)
 export const canEnterNote = (user, matiere) => user.role === 'admin' || (user.role === 'teacher' && same(matiere.teacher, user.id))

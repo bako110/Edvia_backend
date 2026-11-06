@@ -1,4 +1,5 @@
-import { Eleve, Incident } from '../models/index.js'
+import { audit } from './audit.service.js'
+import { Eleve, Incident, Paiement } from '../models/index.js'
 import { forbidden, notFound } from '../utils/errors.js'
 import { canManageEleves, canWriteObs } from '../policies/access.js'
 import { findClasse } from './classe.service.js'
@@ -33,15 +34,20 @@ export async function add(user, classeId, { names }) {
 export async function update(user, id, data) {
   mustManage(user)
   const { eleve } = await findEleve(user, id)
-  if (data.name !== undefined) eleve.name = data.name
-  if (data.matricule !== undefined) eleve.matricule = data.matricule
+  const changes = {}
+  for (const k of ['name', 'matricule', 'status', 'parentName', 'parentPhone', 'parentEmail', 'remise']) {
+    if (data[k] !== undefined && String(eleve[k] ?? '') !== String(data[k])) { changes[k] = [eleve[k] ?? '', data[k]]; eleve[k] = data[k] }
+  }
+  if (Object.keys(changes).length) await audit(user, 'eleve_modifie', { classe: eleve.classe, eleve: eleve._id, detail: { changes } })
   await eleve.save()
 }
 
 export async function remove(user, id) {
   mustManage(user)
   const { eleve } = await findEleve(user, id)
+  await audit(user, 'eleve_supprime', { classe: eleve.classe, eleve: eleve._id, detail: { nom: eleve.name, matricule: eleve.matricule } })
   await Incident.deleteMany({ eleve: eleve._id })
+  await Paiement.deleteMany({ eleve: eleve._id })
   await eleve.deleteOne()
 }
 
@@ -49,5 +55,6 @@ export async function remove(user, id) {
 export async function setObs(user, id, { tr, text }) {
   const { eleve, classe } = await findEleve(user, id)
   if (!canWriteObs(user, classe)) throw forbidden('Réservé à l’administration et au professeur principal')
+  await audit(user, 'observation', { classe: eleve.classe, eleve: eleve._id, detail: { periode: tr, de: eleve.obs?.[tr] || '', a: text } })
   await Eleve.updateOne({ _id: eleve._id }, { $set: { [`obs.${tr}`]: text } })
 }

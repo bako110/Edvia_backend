@@ -1,4 +1,8 @@
-import { Classe, Eleve, User, Incident } from '../models/index.js'
+import { Classe, Eleve, User, Incident, FeePlan, Paiement, Creneau, Devoir } from '../models/index.js'
+import { isOffice } from '../policies/access.js'
+import { audit } from './audit.service.js'
+import { sealCode } from '../utils/seal.js'
+import { TRIM } from '../utils/locks.js'
 import { forClasse } from './incident.service.js'
 import { badRequest, conflict, forbidden, notFound } from '../utils/errors.js'
 import { classAccess } from '../policies/access.js'
@@ -7,7 +11,7 @@ export const DEFAULT_MATIERES = [['Mathématiques', 4], ['Français', 4], ['SVT'
 
 /* ---------- accès ---------- */
 export async function findClasse(user, id) {
-  const c = await Classe.findOne({ _id: id, school: user.school })
+  const c = await Classe.findOne({ _id: id, school: user.school, annee: user.annee })
   if (!c) throw notFound('Classe introuvable')
   return c
 }
@@ -30,7 +34,7 @@ function findMatiere(classe, mid) {
 /* ---------- classes ---------- */
 export async function list(user) {
   const [classes, counts, users] = await Promise.all([
-    Classe.find({ school: user.school }).sort('name'),
+    Classe.find({ school: user.school, annee: user.annee }).sort('name'),
     Eleve.aggregate([{ $match: { school: user.school } }, { $group: { _id: '$classe', n: { $sum: 1 } } }]),
     User.find({ school: user.school }).select('name'),
   ])
@@ -46,7 +50,7 @@ export async function list(user) {
 
 export async function create(user, { name, defaults }) {
   const matieres = defaults === false ? [] : DEFAULT_MATIERES.map(([n, coef]) => ({ name: n, coef }))
-  const c = await Classe.create({ school: user.school, name, matieres })
+  const c = await Classe.create({ school: user.school, annee: user.annee, name, matieres })
   return { id: c.id }
 }
 
@@ -60,8 +64,20 @@ export async function update(user, id, data) {
 export async function remove(user, id) {
   const c = await findClasse(user, id)
   await Eleve.deleteMany({ classe: c._id })
-  await Incident.deleteMany({ classe: c._id })
+  await Promise.all([Incident, FeePlan, Paiement, Creneau, Devoir].map(M => M.deleteMany({ classe: c._id })))
   await c.deleteOne()
+}
+
+// Verrouille / déverrouille un trimestre (fin du conseil de classe) : plus aucune note ni pénalité n'est modifiable tant qu'il est verrouillé
+export async function setLock(user, id, { tr, locked }) {
+  // le personnel peut verrouiller (clore un trimestre) mais seul l'administrateur peut rouvrir des notes
+  if (!locked && user.role !== 'admin') throw forbidden('Seul l’administrateur peut déverrouiller un trimestre')
+  const c = await findClasse(user, id)
+  const was = !!c.locked?.[tr]
+  c.locked = [0, 1, 2].map(i => (i === tr ? locked : !!c.locked?.[i]))
+  await audit(user, locked ? 'verrou' : 'deverrou', { classe: c._id, detail: { trimestre: TRIM[tr], etait: was } })
+  await c.save()
+  return { locked: c.locked }
 }
 
 /* ---------- matières ---------- */
@@ -90,6 +106,8 @@ export async function removeMatiere(user, id, mid) {
   const key = m.id
   m.deleteOne()
   await c.save()
+  await Creneau.deleteMany({ classe: c._id, matiere: key })
+  await Devoir.deleteMany({ classe: c._id, matiere: key })
   // on efface aussi les notes de cette matière
   await Eleve.updateMany({ classe: c._id }, { $unset: { [`notes.0.${key}`]: '', [`notes.1.${key}`]: '', [`notes.2.${key}`]: '' } })
 }
@@ -113,6 +131,7 @@ export async function full(user, id) {
   return {
     classe: {
       id: classe.id, name: classe.name, access,
+      locked: [0, 1, 2].map(i => !!classe.locked?.[i]),
       principalId: classe.principal ? String(classe.principal) : null, principalName: names.get(String(classe.principal)) || null,
     },
     matieres: matieres.map(m => ({
@@ -126,7 +145,15 @@ export async function full(user, id) {
           if (keep.has(mid)) (notes[tr] ||= {})[mid] = [n.d1 || '', n.d2 || '', n.c || '']
         }
       }
-      return { id: String(e._id), name: e.name, matricule: e.matricule || '', notes, obs: access === 'full' ? (e.obs || {}) : {}, incidents: incidents.get(String(e._id)) || [] }
+      const dto = { id: String(e._id), name: e.name, matricule: e.matricule || '', notes, obs: access === 'full' ? (e.obs || {}) : {}, incidents: incidents.get(String(e._id)) || [] }
+      // sceau d'authenticité du bulletin, calculé par le serveur (consultation complète seulement)
+      if (access === 'full') dto.ref = e.ref
+      if (access === 'full') dto.seals = Object.fromEntries([0, 1, 2, 3].map(p => [p, sealCode({ school: classe.school, annee: classe.annee, eleve: e, classe, period: p }, dto.incidents)]))
+      // dossier d'inscription et coordonnées des parents : administration seulement
+      if (isOffice(user)) Object.assign(dto, {
+        status: e.status || 'enrolled', parentName: e.parentName || '', parentPhone: e.parentPhone || '', parentEmail: e.parentEmail || '', remise: e.remise || 0,
+      })
+      return dto
     }),
   }
 }

@@ -10,6 +10,7 @@ mongoose.plugin(schema => {
       delete ret._id
       delete ret.salt
       delete ret.hash
+      delete ret.tokenVersion
       return ret
     },
   })

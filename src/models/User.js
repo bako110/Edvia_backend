@@ -14,6 +14,7 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: { values: ROLES, message: 'Rôle invalide' }, required: true },
   active: { type: Boolean, default: true },
   mustChange: { type: Boolean, default: false },   // mot de passe provisoire à changer
+  tokenVersion: { type: Number, default: 0 },      // incrémenté à chaque changement de mot de passe / rôle / désactivation : les anciens jetons tombent
   // jamais renvoyés ni chargés par défaut
   salt: { type: String, select: false },
   hash: { type: String, select: false },

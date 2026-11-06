@@ -6,6 +6,7 @@ import mongoose from 'mongoose'
 // ou celle de MONGODB_TEST_URI si elle est définie. Chaque exécution crée une base temporaire puis la supprime.
 process.env.MONGODB_URI = process.env.MONGODB_TEST_URI || 'mongodb://127.0.0.1:27017'
 process.env.JWT_SECRET = 'test-secret'
+process.env.RATE_LIMIT = '100000'   // les tests font des milliers d'appels depuis la même adresse
 process.env.DB_NAME = 'edvia_test_' + Date.now()
 const { connectDb, disconnectDb } = await import('../src/config/db.js')
 const { createApp } = await import('../src/app.js')
@@ -61,11 +62,17 @@ test('l’administrateur crée enseignants et personnel', async () => {
   assert.equal((await ok('GET', '/users', { token: S.staff })).length, 5, 'le personnel peut lister l’équipe')
   // changement du mot de passe provisoire
   assert.equal((await call('POST', '/me/password', { token: S.t1, body: { old: 'mauvais', password: 'nouveaumdp1' } })).status, 400)
-  await ok('POST', '/me/password', { token: S.t1, body: { old: 'provisoire1', password: 'nouveaumdp1' } })
+  const chg = await ok('POST', '/me/password', { token: S.t1, body: { old: 'provisoire1', password: 'nouveaumdp1' } })
+  assert.equal((await call('GET', '/me', { token: S.t1 })).status, 401, 'l’ancien jeton est révoqué par le changement de mot de passe')
+  S.t1 = chg.token
+  assert.equal((await call('GET', '/me', { token: S.t1 })).status, 200, 'le jeton neuf fonctionne')
   assert.equal((await ok('POST', '/auth/login', { body: { login: 'kabore', password: 'nouveaumdp1' } })).user.mustChange, false)
   // réinitialisation par l'administrateur
   await ok('PUT', `/users/${S.t3id}/password`, { token: S.admin, body: { password: 'autremdp123' } })
-  assert.equal((await ok('POST', '/auth/login', { body: { login: 'sans.classe', password: 'autremdp123' } })).user.mustChange, true)
+  const relog = await ok('POST', '/auth/login', { body: { login: 'sans.classe', password: 'autremdp123' } })
+  assert.equal(relog.user.mustChange, true)
+  assert.equal((await call('GET', '/me', { token: S.t3 })).status, 401, 'réinitialisation : les sessions ouvertes tombent')
+  S.t3 = relog.token
 })
 
 test('classe, matières et affectation des professeurs', async () => {
@@ -248,6 +255,322 @@ test('vie scolaire : retards, comportement, pénalités avec motif — droits pa
   await ok('DELETE', `/eleves/${tmpId}`, { token: S.admin })
   assert.equal(await mongoose.models.Incident.countDocuments({ eleve: tmpId }), 0)
   void mathsId; void tmp
+})
+
+test('CORS : toute page localhost est acceptée en développement, une adresse inconnue est refusée', async () => {
+  const pre = origin => fetch(base + '/auth/login', { method: 'OPTIONS', headers: { origin, 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type' } })
+  for (const o of ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:49999', 'http://127.0.0.1:4173']) {
+    assert.equal((await pre(o)).headers.get('access-control-allow-origin'), o, 'accepté : ' + o)
+  }
+  for (const o of ['https://pirate.example.com', 'http://localhost.evil.com', 'http://evil.com:5173']) {
+    assert.equal((await pre(o)).headers.get('access-control-allow-origin'), null, 'refusé : ' + o)
+  }
+})
+
+test('sécurité : jetons, mots de passe, limites de débit, aucun secret en sortie', async () => {
+  // mots de passe : lettre + chiffre, pas de mot de passe courant
+  const reg = body => call('POST', '/auth/register', { body })
+  assert.equal((await reg({ school: 'X', name: 'Y', login: 'sec.un', password: 'abcdefghij' })).status, 400, 'sans chiffre')
+  assert.equal((await reg({ school: 'X', name: 'Y', login: 'sec.deux', password: '1234567890' })).status, 400, 'sans lettre')
+  assert.equal((await reg({ school: 'X', name: 'Y', login: 'sec.trois', password: 'Password' })).status, 400)
+  assert.equal((await reg({ school: 'X', name: 'Y', login: 'sec.quatre', password: 'password' })).status, 400, 'mot de passe courant')
+  // rôle modifié ou compte désactivé : jeton immédiatement inutilisable
+  const u = await ok('POST', '/users', { token: S.admin, body: { login: 'tmp.compte', name: 'Temp', role: 'staff', password: 'provisoire9' } })
+  const tok = (await ok('POST', '/auth/login', { body: { login: 'tmp.compte', password: 'provisoire9' } })).token
+  assert.equal((await call('GET', '/me', { token: tok })).status, 200)
+  await ok('PUT', `/users/${u.id}`, { token: S.admin, body: { role: 'teacher' } })
+  assert.equal((await call('GET', '/me', { token: tok })).status, 401, 'changement de rôle : session révoquée')
+  // jeton falsifié (signature, algorithme « none », autre secret)
+  const jwt = (await import('jsonwebtoken')).default
+  assert.equal((await call('GET', '/me', { token: jwt.sign({ uid: u.id, tv: 0 }, 'autre-secret') })).status, 401, 'signature invalide')
+  const none = Buffer.from('{"alg":"none","typ":"JWT"}').toString('base64url') + '.' + Buffer.from(JSON.stringify({ uid: u.id, tv: 1 })).toString('base64url') + '.'
+  assert.equal((await call('GET', '/me', { token: none })).status, 401, 'algorithme none refusé')
+  assert.equal((await call('GET', '/me', { token: jwt.sign({ uid: S.staffId }, 'test-secret') })).status, 401, 'jeton sans version refusé')
+  // aucune sortie ne contient de secret
+  for (const path of ['/users', '/me']) assert.doesNotMatch(JSON.stringify((await call('GET', path, { token: S.admin })).body), /"(hash|salt|tokenVersion)"/)
+  // en-têtes : pas de cache sur l'API, pas de signature serveur
+  const h = await fetch(base + '/me', { headers: { authorization: 'Bearer ' + S.admin } })
+  assert.match(h.headers.get('cache-control'), /no-store/); assert.equal(h.headers.get('x-powered-by'), null)
+  assert.ok(h.headers.get('x-content-type-options'))
+  // limites de débit
+  process.env.REGISTER_LIMIT = '0'
+  assert.equal((await reg({ school: 'Robot', name: 'R', login: 'robot.un', password: 'motdepasse77' })).status, 429, 'création d’établissements limitée')
+  delete process.env.REGISTER_LIMIT
+  process.env.RATE_LIMIT = '1'
+  assert.equal((await call('GET', '/health')).status, 429, 'limite globale par adresse')
+  process.env.RATE_LIMIT = '100000'
+  // blocage par compte même depuis d'autres adresses : 25 échecs
+  for (let i = 0; i < 25; i++) await call('POST', '/auth/login', { body: { login: 'kabore', password: 'faux' + i } })
+  assert.equal((await call('POST', '/auth/login', { body: { login: 'kabore', password: 'nouveaumdp1' } })).status, 429, 'compte verrouillé après trop d’échecs')
+})
+
+test('intégrité des notes : verrou de trimestre, journal d’audit inaltérable, sceau des bulletins', async () => {
+  const put = (token, value, tr = 0, k = 2) => call('PUT', '/notes', { token, body: { eleveId: S.e1, matiereId: S.maths, tr, k, value } })
+  const audit = (q = '') => ok('GET', '/audit' + q, { token: S.admin })
+
+  // --- journal : chaque modification de note garde l'ancienne et la nouvelle valeur, l'auteur et l'adresse
+  assert.equal((await call('GET', '/audit', { token: S.t1 })).status, 403, 'journal fermé aux enseignants')
+  const vu = await ok('GET', '/audit', { token: S.staff })
+  assert.ok(vu.length > 0 && vu.every(a => ['note', 'verrou', 'deverrou', 'penalite', 'sanction', 'incident_supprime', 'absence_justifiee', 'observation', 'eleve_modifie', 'eleve_supprime'].includes(a.action)), 'le personnel ne voit que les actions sur les notes et les élèves')
+  assert.ok(vu.every(a => a.ip === ''), 'le personnel ne voit pas les adresses IP')
+  assert.deepEqual(await ok('GET', '/audit?action=compte_modifie', { token: S.staff }), [], 'rien sur les comptes pour le personnel')
+  assert.ok((await ok('GET', '/audit?action=compte_modifie', { token: S.admin })).length > 0, 'l’administrateur voit tout')
+  const before = (await audit('?action=note')).length
+  assert.equal((await put(S.t1, '15')).status, 200)
+  assert.equal((await put(S.t1, '16')).status, 200)
+  assert.equal((await put(S.t1, '16')).status, 200)   // même valeur : rien à tracer
+  const entries = await audit('?action=note')
+  assert.equal(entries.length, before + 2)
+  const last = entries[0]
+  assert.deepEqual([last.byName, last.role, last.detail.de, last.detail.a, last.detail.matiere], ['M. Kaboré', 'teacher', '15', '16', 'Mathématiques'])
+  assert.equal(last.eleve, 'SAWADOGO Awa'); assert.ok(last.ip)
+  // le journal est en ajout seul, même pour le code applicatif
+  const { AuditLog } = mongoose.models
+  await assert.rejects(() => AuditLog.deleteMany({}), /ajout seul/)
+  await assert.rejects(() => AuditLog.updateOne({}, { $set: { byName: 'x' } }), /ajout seul/)
+  assert.equal((await call('DELETE', '/audit', { token: S.admin })).status, 404, 'aucune route de suppression')
+  assert.equal((await call('PUT', '/audit', { token: S.admin, body: {} })).status, 404)
+
+  // --- sceau d'authenticité d'un bulletin : calculé par le serveur, vérifiable sans compte
+  const full = await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })
+  const awa = full.eleves.find(e => e.id === S.e1)
+  assert.match(awa.seals[0], /^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/)
+  assert.match(awa.ref, /^[A-Z2-9]{4}-[A-Z2-9]{4}$/, 'référence publique courte, sans identifiant de base')
+  assert.notEqual(awa.ref.replace('-', ''), S.e1.slice(0, 8))
+  assert.equal((await ok('GET', `/classes/${S.cl}/full`, { token: S.t1 })).eleves[0].seals, undefined, 'pas de sceau pour un enseignant simple')
+  const verify = (ref, p, code) => call('GET', `/verify?ref=${ref}&p=${p}&code=${code}`)   // sans jeton
+  const good = await verify(awa.ref, 0, awa.seals[0])
+  assert.deepEqual([good.status, good.body.valid, good.body.eleve, good.body.classe], [200, true, 'SAWADOGO Awa', '6è'])
+  assert.deepEqual(Object.keys(good.body).sort(), ['annee', 'classe', 'ecole', 'eleve', 'period', 'valid'], 'aucune note dans la réponse')
+  assert.equal((await verify(awa.ref.toLowerCase().replace('-', ''), 0, awa.seals[0].toLowerCase().replace(/-/g, ''))).body.valid, true, 'saisie tolérante (minuscules, sans tirets)')
+  assert.equal((await verify(S.e1, 0, awa.seals[0])).body.valid, true, 'ancien format accepté')
+  assert.equal((await verify(S.e1, 0, 'AAAA-BBBB-CCCC')).body.valid, false, 'code inventé')
+  assert.equal((await verify(awa.ref, 1, awa.seals[0])).body.valid, false, 'le code d’un trimestre ne vaut pas pour un autre')
+  const zongo = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.find(e => e.id === S.e2)
+  assert.equal((await verify(zongo.ref, 0, awa.seals[0])).body.valid, false, 'le code d’un élève ne vaut pas pour un autre')
+  assert.notEqual(zongo.ref, awa.ref)
+  assert.equal((await verify('ZZZZ-ZZZZ', 0, awa.seals[0])).body.valid, false, 'référence inconnue : même réponse')
+  assert.equal((await verify('0'.repeat(24), 0, awa.seals[0])).body.valid, false)
+  assert.equal((await verify('pas-un-id', 0, awa.seals[0])).status, 400)
+  // une note retouchée change le sceau : l'ancien bulletin papier n'est plus valable
+  await put(S.t1, '18')
+  assert.equal((await verify(awa.ref, 0, awa.seals[0])).body.valid, false, 'bulletin périmé après modification d’une note')
+  const awa2 = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.find(e => e.id === S.e1)
+  assert.equal((await verify(awa.ref, 0, awa2.seals[0])).body.valid, true)
+  // limite d'essais (anti-devinette)
+  process.env.VERIFY_LIMIT = '3'
+  let last429 = 0
+  for (let i = 0; i < 6; i++) last429 = (await verify(awa.ref, 0, 'AAAA-BBBB-CCCC')).status
+  assert.equal(last429, 429, 'trop d’essais de vérification')
+  delete process.env.VERIFY_LIMIT
+
+  // --- verrou de trimestre : plus rien ne bouge, y compris pour l'administrateur, jusqu'au déverrouillage (journalisé)
+  assert.equal((await call('PUT', `/classes/${S.cl}/lock`, { token: S.t2, body: { tr: 0, locked: true } })).status, 403, 'un enseignant ne verrouille pas')
+  assert.equal((await call('PUT', `/classes/${S.cl}/lock`, { token: S.staff, body: { tr: 0, locked: true } })).status, 200, 'le personnel peut verrouiller')
+  assert.equal((await call('PUT', `/classes/${S.cl}/lock`, { token: S.staff, body: { tr: 0, locked: false } })).status, 403, 'mais pas déverrouiller')
+  assert.equal((await call('PUT', `/classes/${S.cl}/lock`, { token: S.admin, body: { tr: 5, locked: true } })).status, 400)
+  assert.deepEqual((await ok('PUT', `/classes/${S.cl}/lock`, { token: S.admin, body: { tr: 0, locked: true } })).locked, [true, false, false])
+  assert.deepEqual((await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).classe.locked, [true, false, false])
+  const blocked = await put(S.t1, '2')
+  assert.equal(blocked.status, 403); assert.match(blocked.body.error, /verrouillé/)
+  assert.equal((await put(S.admin, '2')).status, 403, 'même l’administrateur doit déverrouiller d’abord')
+  assert.equal((await put(S.t1, '17', 1)).status, 200, 'les autres trimestres restent ouverts')
+  const pen = { tr: 0, type: 'penalite', points: 1, matiereId: S.maths, motif: 'Triche constatée' }
+  assert.equal((await call('POST', `/eleves/${S.e1}/incidents`, { token: S.admin, body: pen })).status, 403, 'pénalité (elle change la moyenne) bloquée aussi')
+  assert.equal((await call('POST', `/eleves/${S.e1}/incidents`, { token: S.admin, body: { tr: 0, type: 'retard', minutes: 5 } })).status, 201, 'un retard ne change pas la moyenne')
+  await ok('PUT', `/classes/${S.cl}/lock`, { token: S.admin, body: { tr: 0, locked: false } })
+  assert.equal((await put(S.t1, '12')).status, 200, 'déverrouillé : la saisie reprend')
+  const acts = (await audit()).map(a => a.action)
+  assert.ok(acts.includes('verrou') && acts.includes('deverrou'), 'verrouillage et déverrouillage tracés')
+  const pen2 = await ok('POST', `/eleves/${S.e1}/incidents`, { token: S.admin, body: pen })
+  const traced = (await audit('?action=penalite'))[0]
+  assert.deepEqual([traced.detail.points, traced.detail.motif, traced.byName], [1, 'Triche constatée', 'Directeur'])
+  const nbDel = (await audit('?action=incident_supprime')).length
+  await ok('DELETE', `/incidents/${pen2.id}`, { token: S.admin })
+  assert.equal((await audit('?action=incident_supprime')).length, nbDel + 1, 'suppression d’une pénalité tracée')
+  assert.ok((await audit()).every(a => a.at && a.byName), 'toutes les entrées ont une date et un auteur')
+})
+
+test('frais de scolarité : plan par classe, versements, droits par profil', async () => {
+  const plan = { capacity: 0, inscription: 10000, scolarite: 90000, modalite: 'trimestriel' }
+  assert.equal((await call('PUT', `/classes/${S.cl}/finance`, { token: S.staff, body: plan })).status, 403, 'le plan est fixé par l’administrateur')
+  assert.equal((await call('GET', `/classes/${S.cl}/finance`, { token: S.t1 })).status, 403, 'les enseignants n’ont pas accès aux finances')
+  assert.equal((await call('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: { ...plan, tranches: [{ label: 'A', amount: 1000, due: '2026-10-15' }] } })).status, 400, 'somme des échéances ≠ scolarité')
+  const saved = await ok('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: plan })
+  assert.deepEqual(saved.tranches.map(t => t.amount), [30000, 30000, 30000], 'échéancier généré selon la modalité')
+  assert.equal((await call('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: { ...plan, modalite: 'annuel', tranches: saved.tranches } })).status, 400, 'paiement annuel = une seule échéance')
+
+  // versements : trop-perçu refusé, reçu numéroté, remise
+  const pay = (token, id, body) => call('POST', `/eleves/${id}/paiements`, { token, body })
+  assert.equal((await pay(S.t1, S.e1, { kind: 'scolarite', amount: 5000 })).status, 403)
+  assert.equal((await pay(S.staff, S.e1, { kind: 'scolarite', amount: 999999 })).status, 400, 'trop-perçu refusé')
+  assert.equal((await pay(S.staff, S.e1, { kind: 'scolarite', amount: 12.5 })).status, 400, 'montant entier')
+  const p1 = (await pay(S.staff, S.e1, { kind: 'scolarite', amount: 30000, method: 'mobile_money', reference: 'OM123' })).body
+  assert.match(p1.receipt, /^R\d{6}-[0-9A-F]{5}$/); assert.equal(p1.byName, 'Secrétariat')
+  await ok('POST', `/eleves/${S.e1}/paiements`, { token: S.staff, body: { kind: 'inscription', amount: 10000 } })
+  await ok('PUT', `/eleves/${S.e2}`, { token: S.admin, body: { remise: 30000 } })
+  const fin = await ok('GET', `/classes/${S.cl}/finance`, { token: S.staff })
+  const a = fin.eleves.find(e => e.id === S.e1), z = fin.eleves.find(e => e.id === S.e2)
+  assert.deepEqual([a.due, a.paid, a.balance], [100000, 40000, 60000])
+  assert.deepEqual([z.due, z.paid, z.balance], [70000, 0, 70000], 'remise déduite de la scolarité')
+  assert.equal(a.paiements.length, 2); assert.equal(fin.totals.paid, 40000)
+  assert.equal((await ok('GET', '/finance', { token: S.admin })).classes.find(c => c.id === S.cl).paid, 40000)
+  assert.equal((await call('DELETE', `/paiements/${p1.id}`, { token: S.staff })).status, 403, 'seul l’administrateur annule un versement')
+  await ok('DELETE', `/paiements/${p1.id}`, { token: S.admin })
+  assert.equal((await ok('GET', `/classes/${S.cl}/finance`, { token: S.admin })).totals.paid, 10000)
+})
+
+test('inscription : dossier, parent, effectif maximum', async () => {
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.t1, body: { name: 'NEW Eleve', parentPhone: '70123456' } })).status, 403)
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'NEW Eleve', parentPhone: 'abc' } })).status, 400)
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'NEW Eleve' } })).status, 400, 'numéro à contacter obligatoire')
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'NEW Eleve', parentPhone: '1234' } })).status, 400, 'numéro trop court')
+  const r = await ok('POST', `/classes/${S.cl}/inscriptions`, {
+    token: S.staff, body: { name: 'OUEDRAOGO Salif', parentName: 'M. Ouédraogo', parentPhone: '70 12 34 56', parentEmail: 'p@ex.bf', paiement: { amount: 10000, method: 'especes' } },
+  })
+  assert.equal(r.paiement.amount, 10000); S.e3 = r.id
+  const el = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.find(e => e.id === S.e3)
+  assert.deepEqual([el.status, el.parentName, el.parentPhone], ['enrolled', 'M. Ouédraogo', '70 12 34 56'])
+  assert.equal((await ok('GET', `/classes/${S.cl}/full`, { token: S.t1 })).eleves.find(e => e.id === S.e3).parentPhone, undefined, 'coordonnées parents : administration seulement')
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'OUEDRAOGO Salif', parentPhone: '70123456' } })).status, 409, 'doublon refusé')
+  // effectif maximum
+  const base = { capacity: 4, inscription: 10000, scolarite: 90000, modalite: 'trimestriel' }
+  await ok('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: base })
+  assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'TROP Tard', parentPhone: '70123456' } })).status, 409, 'classe complète')
+  await ok('PUT', `/eleves/${S.e3}`, { token: S.staff, body: { status: 'withdrawn' } })
+  await ok('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'PLACE Libre', status: 'pending', parentPhone: '70123456' } })
+  const ov = await ok('GET', '/inscriptions', { token: S.staff })
+  const c = ov.classes.find(x => x.id === S.cl)
+  assert.deepEqual([c.enrolled, c.pending, c.withdrawn, c.capacity, c.free], [3, 1, 1, 4, 0])
+  await ok('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: { ...base, capacity: 0 } })
+})
+
+test('emploi du temps : conflits de classe et d’enseignant', async () => {
+  const cr = (token, classe, body) => call('POST', `/classes/${classe}/creneaux`, { token, body })
+  assert.equal((await cr(S.staff, S.cl, { matiereId: S.maths, day: 1, start: '08:00', end: '10:00' })).status, 403, 'administrateur seul')
+  assert.equal((await cr(S.admin, S.cl, { matiereId: S.maths, day: 1, start: '10:00', end: '08:00' })).status, 400)
+  const c1 = await ok('POST', `/classes/${S.cl}/creneaux`, { token: S.admin, body: { matiereId: S.maths, day: 1, start: '08:00', end: '10:00', room: 'Salle 3' } })
+  assert.deepEqual([c1.matiere, c1.teacher, c1.start], ['Mathématiques', 'M. Kaboré', '08:00'])
+  assert.equal((await cr(S.admin, S.cl, { matiereId: S.fr, day: 1, start: '09:00', end: '11:00' })).status, 409, 'la classe a déjà un cours')
+  await ok('POST', `/classes/${S.cl}/creneaux`, { token: S.admin, body: { matiereId: S.fr, day: 1, start: '10:00', end: '12:00' } })   // bout à bout : accepté
+  // même enseignant dans une autre classe au même moment
+  const other = (await ok('POST', '/classes', { token: S.admin, body: { name: '5è', defaults: false } })).id
+  const m5 = (await ok('POST', `/classes/${other}/matieres`, { token: S.admin, body: { name: 'Maths 5', coef: 2, teacher: S.t1id } })).id
+  assert.equal((await cr(S.admin, other, { matiereId: m5, day: 1, start: '09:00', end: '10:00' })).status, 409, 'M. Kaboré est déjà en cours')
+  await ok('POST', `/classes/${other}/creneaux`, { token: S.admin, body: { matiereId: m5, day: 2, start: '09:00', end: '10:00' } })
+  // consultation
+  const mine = await ok('GET', '/emploi-du-temps/mon', { token: S.t1 })
+  assert.deepEqual(mine.creneaux.map(c => [c.classe, c.day]), [['6è', 1], ['5è', 2]])
+  assert.equal((await ok('GET', `/classes/${S.cl}/emploi-du-temps`, { token: S.t2 })).creneaux.length, 2)
+  assert.equal((await call('GET', `/classes/${S.cl}/emploi-du-temps`, { token: S.t3 })).status, 403)
+  assert.equal((await call('GET', '/emploi-du-temps/mon', { token: S.staff })).status, 403)
+  const tout = await ok('GET', '/emploi-du-temps', { token: S.staff })
+  assert.deepEqual([...new Set(tout.creneaux.map(c => c.classe))], ['5è', '6è'], 'tout le programme, classé par classe')
+  assert.equal((await call('GET', '/emploi-du-temps', { token: S.t1 })).status, 403)
+  // déplacer un cours
+  await ok('PUT', `/creneaux/${c1.id}`, { token: S.admin, body: { start: '08:00', end: '09:30' } })
+  await ok('DELETE', `/creneaux/${c1.id}`, { token: S.admin })
+  await ok('DELETE', `/classes/${other}`, { token: S.admin })
+  assert.equal(await mongoose.models.Creneau.countDocuments({ classe: other }), 0)
+})
+
+test('communication avec les parents et justification des absences', async () => {
+  const send = (token, body) => call('POST', '/messages', { token, body })
+  assert.equal((await send(S.t1, { audience: 'classe', classeId: S.cl, channel: 'sms', body: 'Bonjour' })).status, 403)
+  assert.equal((await send(S.staff, { audience: 'classe', channel: 'sms', body: 'Bonjour' })).status, 400, 'classe obligatoire')
+  await ok('PUT', `/eleves/${S.e1}`, { token: S.staff, body: { parentName: 'Mme Sawadogo', parentPhone: '+226 70 00 00 01' } })
+  const m = await ok('POST', '/messages', { token: S.staff, body: { audience: 'classe', classeId: S.cl, channel: 'whatsapp', body: 'Bonjour {parent}, réunion pour {eleve} ({classe}).' } })
+  assert.equal(m.recipients.length, 2, 'Awa et le dossier en attente (numéro obligatoire)')
+  const awa = m.recipients.find(r => r.eleveId === S.e1)
+  assert.equal(awa.phone, '22670000001')
+  assert.equal(awa.text, 'Bonjour Mme Sawadogo, réunion pour SAWADOGO Awa (6è).')
+  assert.ok(m.missing.length >= 2, 'élèves sans numéro signalés')
+  const sms = await ok('POST', '/messages', { token: S.staff, body: { audience: 'eleve', eleveId: S.e1, channel: 'sms', body: 'Solde : {solde}' } })
+  assert.match(sms.recipients[0].text, /^Solde : 90 000 FCFA$/)
+  assert.equal((await send(S.staff, { audience: 'eleve', eleveId: S.e1, channel: 'email', body: 'x' })).status, 201, 'sans e-mail : signalé, pas d’erreur')
+  const hist = await ok('GET', '/messages', { token: S.admin })
+  assert.equal(hist[0].channel, 'email'); assert.ok(hist.length >= 3)
+  assert.equal((await call('GET', '/messages', { token: S.t1 })).status, 403)
+
+  // justification d'une absence
+  const inc = await ok('POST', `/eleves/${S.e1}/incidents`, { token: S.t1, body: { tr: 0, type: 'absence', hours: 2 } })
+  assert.equal(inc.justified, false)
+  assert.equal((await call('PUT', `/incidents/${inc.id}`, { token: S.t1, body: { justified: true } })).status, 403)
+  assert.equal((await ok('PUT', `/incidents/${inc.id}`, { token: S.staff, body: { justified: true } })).justified, true)
+  const retard = await ok('POST', `/eleves/${S.e1}/incidents`, { token: S.t1, body: { tr: 0, type: 'retard', minutes: 10 } })
+  assert.equal((await call('PUT', `/incidents/${retard.id}`, { token: S.admin, body: { justified: true } })).status, 400)
+})
+
+test('dépôt chiffré des devoirs : seul le texte chiffré transite, accès par profil', async () => {
+  const sealed = Buffer.from('CHIFFRE-' + 'x'.repeat(200))
+  const meta = { classeId: S.cl, matiereId: S.maths, title: 'Devoir 1 — Maths', note: 'Sujet du 12 octobre', size: 150, salt: 'c2VsLXNlbC1zZWwtc2Vs', iv: 'aXYtaXYtaXYtaXY=', iter: 310000 }
+  const up = (token, id, body) => fetch(`${base}/devoirs/${id}/fichier`, { method: 'PUT', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/octet-stream' }, body })
+  const get = (token, id) => fetch(`${base}/devoirs/${id}/fichier`, { headers: { authorization: 'Bearer ' + token } })
+
+  assert.equal((await call('POST', '/devoirs', { token: S.admin, body: meta })).status, 403, 'dépôt réservé aux enseignants')
+  assert.equal((await call('POST', '/devoirs', { token: S.t2, body: meta })).status, 403, 'pas dans la matière d’un collègue')
+  assert.equal((await call('POST', '/devoirs', { token: S.t1, body: { ...meta, iter: 10 } })).status, 400, 'dérivation de clé trop faible')
+  const d = await ok('POST', '/devoirs', { token: S.t1, body: meta })
+  assert.equal(d.sealed, false); assert.equal(d.matiere, 'Mathématiques'); assert.equal(d.data, undefined)
+  assert.equal((await up(S.t2, d.id, sealed)).status, 404, 'seul l’auteur envoie le fichier')
+  assert.equal((await up(S.t1, d.id, Buffer.from('court'))).status, 400)
+  assert.equal((await up(S.t1, d.id, sealed)).status, 200)
+  assert.equal((await up(S.t1, d.id, sealed)).status, 409, 'une seule fois')
+
+  // administration et auteur récupèrent exactement les octets chiffrés ; un autre enseignant non
+  for (const t of [S.admin, S.staff, S.t1]) { const r = await get(t, d.id); assert.equal(r.status, 200); assert.deepEqual(Buffer.from(await r.arrayBuffer()), sealed) }
+  assert.equal((await get(S.t2, d.id)).status, 403)
+  assert.equal((await ok('GET', '/devoirs', { token: S.admin })).length, 1)
+  assert.equal((await ok('GET', '/devoirs', { token: S.admin }))[0].annee, (await import('../src/utils/year.js')).currentSchoolYear())
+  assert.equal((await ok('GET', '/devoirs', { token: S.t1 })).length, 1)
+  assert.equal((await ok('GET', '/devoirs', { token: S.t2 })).length, 0, 'chacun ne voit que les siens')
+  const rawInDb = await mongoose.models.Devoir.findById(d.id).select('+data').lean()
+  assert.deepEqual(Buffer.from(rawInDb.data.buffer), sealed, 'la base ne contient que le texte chiffré')
+  assert.equal((await call('DELETE', `/devoirs/${d.id}`, { token: S.t2 })).status, 403)
+  assert.equal((await call('DELETE', `/devoirs/${d.id}`, { token: S.admin })).status, 403, 'l’administration ne supprime pas un dépôt')
+  assert.equal((await call('DELETE', `/devoirs/${d.id}`, { token: S.staff })).status, 403)
+  await ok('DELETE', `/devoirs/${d.id}`, { token: S.t1 })
+  assert.equal((await ok('GET', '/devoirs', { token: S.admin })).length, 0)
+})
+
+test('années scolaires : l’année réelle reste valide, on peut préparer la suivante et consulter les archives', async () => {
+  const { currentSchoolYear } = await import('../src/utils/year.js')
+  const cur = currentSchoolYear(), start = parseInt(cur, 10)
+  const next = `${start + 1}-${start + 2}`, prev = `${start - 1}-${start}`
+  const put = (token, body) => call('PUT', '/school/annee', { token, body })
+  const note = value => call('PUT', '/notes', { token: S.t1, body: { eleveId: S.e1, matiereId: S.maths, tr: 0, k: 0, value } })
+  assert.equal((await ok('GET', '/school', { token: S.admin })).annee, cur, 'un nouvel établissement démarre sur l’année réelle')
+  assert.equal((await put(S.t1, { annee: next, create: true })).status, 403)
+  assert.equal((await put(S.staff, { annee: next, create: true })).status, 403)
+  assert.equal((await put(S.admin, { annee: `${start}-${start + 2}` })).status, 400, 'deux années consécutives')
+  assert.equal((await put(S.admin, { annee: '2090-2091' })).status, 404, 'inexistante sans création')
+  const eleves = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.length
+
+  // préparer l'année suivante : classes, matières, enseignants et frais repris, sans les élèves
+  const sch = await ok('PUT', '/school/annee', { token: S.admin, body: { annee: next, create: true, copyFrom: cur } })
+  assert.equal(sch.annee, next); assert.deepEqual(sch.annees, [cur, next])
+  const list = await ok('GET', '/classes', { token: S.admin })
+  assert.equal(list.length, 1); assert.notEqual(list[0].id, S.cl); assert.equal(list[0].nbEleves, 0); assert.equal(list[0].nbMatieres, 6)
+  assert.equal((await call('GET', `/classes/${S.cl}/full`, { token: S.admin })).status, 404, 'les données de l’autre année ne sont pas visibles')
+  const fin = await ok('GET', `/classes/${list[0].id}/finance`, { token: S.admin })
+  assert.equal(fin.plan.scolarite, 90000); assert.equal(fin.plan.tranches[0].due.slice(0, 4), String(start + 1), 'échéances décalées d’un an')
+  assert.equal((await ok('GET', '/classes', { token: S.t1 })).length, 1)
+  await ok('POST', `/classes/${list[0].id}/eleves`, { token: S.admin, body: { names: ['NOUVEAU Eleve'] } })
+
+  // retour sur l'année réelle : elle reste PLEINEMENT valide malgré l'année suivante déjà ouverte
+  await ok('PUT', '/school/annee', { token: S.admin, body: { annee: cur } })
+  assert.equal((await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.length, eleves)
+  assert.equal((await note('10')).status, 200, 'l’enseignant continue de saisir dans l’année en cours')
+  await ok('PUT', `/eleves/${S.e1}`, { token: S.staff, body: { parentName: 'Mme Sawadogo' } })
+
+  // une année TERMINÉE est en consultation seule pour les enseignants ; l'administration garde la main
+  await ok('PUT', '/school/annee', { token: S.admin, body: { annee: prev, create: true } })
+  assert.equal((await call('GET', '/classes', { token: S.t1 })).status, 200, 'consultation autorisée')
+  assert.equal((await note('11')).status, 403, 'enseignant : lecture seule sur une année terminée')
+  await ok('POST', '/classes', { token: S.admin, body: { name: 'Archive 6è' } })
+  await ok('PUT', '/school/annee', { token: S.admin, body: { annee: cur } })
+  assert.equal((await note('12')).status, 200, 'retour à l’année réelle : saisie de nouveau possible')
+  assert.equal((await ok('GET', '/messages', { token: S.admin })).length >= 3, true, 'les messages suivent l’année')
 })
 
 test('isolation entre établissements', async () => {

@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken'
 import { config } from '../config/env.js'
-import { User } from '../models/index.js'
+import { School, User } from '../models/index.js'
+import { isArchiveYear } from '../utils/year.js'
 import { unauthorized, forbidden } from '../utils/errors.js'
 
 // Vérifie le jeton et recharge l'utilisateur : un compte désactivé est refusé immédiatement
@@ -11,6 +12,15 @@ export async function authenticate(req, res, next) {
   catch { throw unauthorized('Session expirée, reconnectez-vous') }
   const user = /^[0-9a-f]{24}$/i.test(payload.uid) ? await User.findById(payload.uid) : null
   if (!user || !user.active) throw unauthorized('Compte désactivé ou introuvable')
+  if (payload.tv !== (user.tokenVersion || 0)) throw unauthorized('Session expirée, reconnectez-vous')   // mot de passe, rôle ou statut modifié depuis
+  // année scolaire affichée à tous (choisie par l'administrateur) ; seules les années TERMINÉES sont en consultation seule pour les enseignants
+  const school = await School.findById(user.school).select('annee annees')
+  user.annee = school.annee
+  user.ip = req.ip
+  user.archive = isArchiveYear(school.annee)
+  if (user.archive && user.role === 'teacher' && !req.originalUrl.startsWith('/api/me') && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    throw forbidden('Année archivée : consultation seule pour les enseignants')
+  }
   req.user = user
   next()
 }

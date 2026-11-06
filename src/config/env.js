@@ -40,7 +40,15 @@ export const config = {
   get jwtSecret() { return jwtSecret() },
   get jwtExpires() { return process.env.JWT_EXPIRES || '12h' },
   get corsOrigins() { return list(process.env.CORS_ORIGIN) },
+  // Nombre de proxys de confiance devant le serveur (Render, etc.) : nécessaire pour connaître la vraie adresse IP des visiteurs.
+  // Par défaut : 1 en production (hébergeur), 0 en local. TRUST_PROXY=0 pour le désactiver.
+  get trustProxy() { const v = process.env.TRUST_PROXY; return v === undefined || v === '' ? (this.isProd ? 1 : 0) : /^\d+$/.test(v) ? Number(v) : v },
   get dnsServers() { return list(process.env.DNS_SERVERS) },
+  get connectSrc() { return list(process.env.CONNECT_SRC) },
+  // Accepte les pages ouvertes sur http://localhost:<n'importe quel port> (Vite choisit un autre port si 5173 est pris).
+  // Par défaut : oui en développement, non en production ; CORS_ALLOW_LOCALHOST=true l'active aussi sur un serveur en ligne
+  // (utile pour utiliser le serveur en ligne depuis l'application lancée sur votre ordinateur).
+  get allowLocalhost() { const v = process.env.CORS_ALLOW_LOCALHOST; return v === undefined || v === '' ? !this.isProd : /^(1|true|oui|yes)$/i.test(v) },
   staticDir: path.join(root, '..', 'react-app', 'dist'),
 }
 

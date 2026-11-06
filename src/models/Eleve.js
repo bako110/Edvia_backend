@@ -1,5 +1,6 @@
 import mongoose from 'mongoose'
 import './plugins.js'
+import { makeRef } from '../utils/ref.js'
 
 const { ObjectId, Mixed } = mongoose.Schema.Types
 
@@ -14,6 +15,15 @@ const eleveSchema = new mongoose.Schema({
   classe: { type: ObjectId, ref: 'Classe', required: true },
   name: { type: String, required: [true, 'Le nom de l’élève est obligatoire'], trim: true, maxlength: 100 },
   matricule: { type: String, default: '', trim: true, maxlength: 30 },
+  ref: { type: String, default: makeRef, unique: true, sparse: true },   // référence publique (bulletin, vérification)
+  // Inscription : pending = dossier en attente, enrolled = inscrit(e), withdrawn = retiré(e)
+  status: { type: String, enum: ['pending', 'enrolled', 'withdrawn'], default: 'enrolled' },
+  enrolledAt: { type: Date, default: Date.now },
+  // Parent / tuteur (communication avec les familles)
+  parentName: { type: String, default: '', trim: true, maxlength: 100 },
+  parentPhone: { type: String, default: '', trim: true, maxlength: 25 },
+  parentEmail: { type: String, default: '', trim: true, lowercase: true, maxlength: 120 },
+  remise: { type: Number, default: 0, min: 0 },        // réduction / bourse sur la scolarité (FCFA)
   notes: { type: Mixed, default: () => ({}) },
   obs: { type: Mixed, default: () => ({}) },
 }, { timestamps: true, minimize: false })

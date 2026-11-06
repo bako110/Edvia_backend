@@ -1,3 +1,5 @@
+import { pickExtra } from '../utils/student.js'
+import { assertCapacity } from './license.service.js'
 import { Classe, Eleve, FeePlan } from '../models/index.js'
 import { conflict, forbidden } from '../utils/errors.js'
 import { canManageEleves } from '../policies/access.js'
@@ -8,6 +10,7 @@ import { addPaiement } from './finance.service.js'
 export async function enroll(user, classeId, data) {
   if (!canManageEleves(user)) throw forbidden('Seule l’administration enregistre les élèves')
   const classe = await findClasse(user, classeId)
+  await assertCapacity(user, 1)
   const plan = await FeePlan.findOne({ classe: classe._id }).lean()
   const status = data.status || 'enrolled'
   if (plan?.capacity > 0 && status !== 'withdrawn') {
@@ -17,6 +20,7 @@ export async function enroll(user, classeId, data) {
   const eleve = await Eleve.create({
     school: user.school, classe: classe._id, name: data.name, matricule: data.matricule || '', status,
     parentName: data.parentName || '', parentPhone: data.parentPhone || '', parentEmail: data.parentEmail || '', remise: data.remise || 0,
+    ...pickExtra(data),
   })
   let paiement = null
   if (data.paiement) paiement = await addPaiement(user, eleve._id, { kind: 'inscription', method: 'especes', ...data.paiement })

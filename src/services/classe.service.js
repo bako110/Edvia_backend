@@ -1,3 +1,4 @@
+import { extraDto } from '../utils/student.js'
 import { Classe, Eleve, User, Incident, FeePlan, Paiement, Creneau, Devoir } from '../models/index.js'
 import { isOffice } from '../policies/access.js'
 import { audit } from './audit.service.js'
@@ -151,7 +152,7 @@ export async function full(user, id) {
       if (access === 'full') dto.seals = Object.fromEntries([0, 1, 2, 3].map(p => [p, sealCode({ school: classe.school, annee: classe.annee, eleve: e, classe, period: p }, dto.incidents)]))
       // dossier d'inscription et coordonnées des parents : administration seulement
       if (isOffice(user)) Object.assign(dto, {
-        status: e.status || 'enrolled', parentName: e.parentName || '', parentPhone: e.parentPhone || '', parentEmail: e.parentEmail || '', remise: e.remise || 0,
+        status: e.status || 'enrolled', parentName: e.parentName || '', parentPhone: e.parentPhone || '', parentEmail: e.parentEmail || '', remise: e.remise || 0, ...extraDto(e),
       })
       return dto
     }),

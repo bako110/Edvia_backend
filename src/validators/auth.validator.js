@@ -3,6 +3,7 @@ import { text, loginField, passwordField } from './common.js'
 
 export const registerBody = z.object({
   school: text('Nom de l’établissement'),
+  license: z.string({ required_error: 'Le code de licence est obligatoire' }).trim().min(6, 'Le code de licence est obligatoire').max(40, 'Code de licence invalide'),
   name: text('Nom de l’administrateur', { max: 80 }),
   login: loginField,
   password: passwordField,

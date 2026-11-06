@@ -3,6 +3,8 @@ import { config } from '../config/env.js'
 import { School, User } from '../models/index.js'
 import { conflict, badRequest, forbidden, unauthorized } from '../utils/errors.js'
 import { makeLimiter } from '../utils/loginLimiter.js'
+import mongoose from 'mongoose'
+import { claim, applyTo, release } from './license.service.js'
 import crypto from 'node:crypto'
 import { AuditLog } from '../models/index.js'
 
@@ -11,17 +13,22 @@ const accountLimiter = makeLimiter(25, 15 * 60 * 1000) // par identifiant, quell
 const sign = user => jwt.sign({ uid: user.id, tv: user.tokenVersion || 0 }, config.jwtSecret, { expiresIn: config.jwtExpires })
 const session = (user, school) => ({ token: sign(user), user, school })
 
-// Nouvel établissement + son compte administrateur
-export async function register({ school, name, login, password }) {
+// Nouvel établissement + son compte administrateur : exige un code de licence valide (remis par EDVIA), à usage unique
+export async function register({ school, name, login, password, license }) {
   if (await User.exists({ login })) throw conflict('Cet identifiant est déjà utilisé')
-  const sch = await School.create({ name: school })
+  const _id = new mongoose.Types.ObjectId()
+  const lic = await claim(license, _id)               // échoue (sans rien créer) si le code est faux, déjà utilisé ou annulé
+  let sch
   try {
+    sch = await School.create({ _id, name: school })
+    await applyTo(sch, lic)
     const user = new User({ school: sch._id, login, name, role: 'admin' })
     user.setPassword(password)
     await user.save()
-    return session(user, sch)
+    return session(user, await School.findById(sch._id))
   } catch (e) {
-    await School.deleteOne({ _id: sch._id })   // pas d'établissement orphelin
+    await School.deleteOne({ _id })                   // pas d'établissement orphelin
+    await release(lic._id)                            // le code redevient utilisable
     throw e
   }
 }

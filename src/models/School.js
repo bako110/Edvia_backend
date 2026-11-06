@@ -9,7 +9,12 @@ const schoolSchema = new mongoose.Schema({
   ministere: { type: String, default: 'MINISTÈRE DE L’ÉDUCATION', trim: true, maxlength: 160 },
   devise: { type: String, default: 'La Patrie ou la Mort, nous vaincrons', trim: true, maxlength: 160 },
   annee: { type: String, default: () => currentSchoolYear(), trim: true, maxlength: 20 },   // année affichée à tout le monde (choisie par l'administrateur)
-  annees: { type: [String], default: undefined },                            // toutes les années existantes
+  annees: { type: [String], default: undefined },
+  // licence : durée, état et limite d'élèves (le code est remis par le propriétaire de la plateforme)
+  licenseExpires: { type: Date, default: null },
+  licenseStatus: { type: String, enum: ['active', 'revoked'], default: 'active' },
+  licenseCode: { type: String, select: false },
+  maxStudents: { type: Number, default: 0, min: 0 },                         // 0 = illimité                            // toutes les années existantes
   proviseur: { type: String, default: '', trim: true, maxlength: 80 },
   slogan: { type: String, default: '', trim: true, maxlength: 120 },
   // identité visuelle propre à chaque établissement

@@ -1,3 +1,5 @@
+import { EXTRA_FIELDS, isoDate, normalizeRecord, parseLine, pickExtra } from '../utils/student.js'
+import { assertCapacity } from './license.service.js'
 import { audit } from './audit.service.js'
 import { Eleve, Incident, Paiement } from '../models/index.js'
 import { forbidden, notFound } from '../utils/errors.js'
@@ -13,21 +15,19 @@ function mustManage(user) {
   if (!canManageEleves(user)) throw forbidden('Seule l’administration enregistre et modifie les élèves')
 }
 
-// Ajout en lot : lignes « NOM Prénom » ou « NOM Prénom ; matricule » (doublons ignorés)
-export async function add(user, classeId, { names }) {
+// Ajout en lot : lignes collées et/ou fiches complètes (import Excel / CSV / PDF), doublons ignorés
+export async function add(user, classeId, { names = [], students = [] }) {
   mustManage(user)
   const classe = await findClasse(user, classeId)
   const existing = new Set((await Eleve.find({ classe: classe._id }).select('name')).map(e => e.name))
   const docs = [], seen = new Set()
   let skipped = 0
-  for (const line of names) {
-    const [n, m = ''] = line.split(';')
-    const name = n.replace(/\s+/g, ' ').trim().slice(0, 100)
-    if (!name || existing.has(name) || seen.has(name)) { skipped++; continue }
-    seen.add(name)
-    docs.push({ school: user.school, classe: classe._id, name, matricule: m.trim().slice(0, 30) })
+  for (const rec of [...students.map(normalizeRecord), ...names.map(parseLine)]) {
+    if (!rec.name || existing.has(rec.name) || seen.has(rec.name)) { skipped++; continue }
+    seen.add(rec.name)
+    docs.push({ school: user.school, classe: classe._id, ...rec })
   }
-  if (docs.length) await Eleve.insertMany(docs, { ordered: false })
+  if (docs.length) { await assertCapacity(user, docs.length); await Eleve.insertMany(docs, { ordered: false }) }
   return { added: docs.length, skipped }
 }
 
@@ -35,8 +35,12 @@ export async function update(user, id, data) {
   mustManage(user)
   const { eleve } = await findEleve(user, id)
   const changes = {}
-  for (const k of ['name', 'matricule', 'status', 'parentName', 'parentPhone', 'parentEmail', 'remise']) {
+  for (const k of ['name', 'matricule', 'status', 'parentName', 'parentPhone', 'parentEmail', 'remise', ...EXTRA_FIELDS]) {
     if (data[k] !== undefined && String(eleve[k] ?? '') !== String(data[k])) { changes[k] = [eleve[k] ?? '', data[k]]; eleve[k] = data[k] }
+  }
+  if (data.birthDate !== undefined && isoDate(eleve.birthDate) !== data.birthDate) {
+    changes.birthDate = [isoDate(eleve.birthDate), data.birthDate]
+    eleve.birthDate = pickExtra({ birthDate: data.birthDate }).birthDate
   }
   if (Object.keys(changes).length) await audit(user, 'eleve_modifie', { classe: eleve.classe, eleve: eleve._id, detail: { changes } })
   await eleve.save()

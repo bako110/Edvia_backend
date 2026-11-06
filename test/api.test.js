@@ -6,10 +6,15 @@ import mongoose from 'mongoose'
 // ou celle de MONGODB_TEST_URI si elle est définie. Chaque exécution crée une base temporaire puis la supprime.
 process.env.MONGODB_URI = process.env.MONGODB_TEST_URI || 'mongodb://127.0.0.1:27017'
 process.env.JWT_SECRET = 'test-secret'
-process.env.RATE_LIMIT = '100000'   // les tests font des milliers d'appels depuis la même adresse
+process.env.OWNER_KEY = 'cle-proprietaire-de-test-0123456789'
+process.env.RATE_LIMIT = '100000'
+process.env.REGISTER_LIMIT = '1000'   // les tests font des milliers d'appels depuis la même adresse
 process.env.DB_NAME = 'edvia_test_' + Date.now()
 const { connectDb, disconnectDb } = await import('../src/config/db.js')
 const { createApp } = await import('../src/app.js')
+const { generateCode } = await import('../src/services/license.service.js')
+// licence de test : créée directement en base, comme le ferait le propriétaire de la plateforme
+const lic = async (o = {}) => (await mongoose.models.License.create({ code: generateCode(), days: 365, ...o })).code
 
 let server, base
 before(async () => {
@@ -35,10 +40,10 @@ const S = {}   // état partagé entre les étapes
 
 test('inscription de l’établissement et connexion', async () => {
   assert.equal((await call('POST', '/auth/register', { body: { school: 'Lycée A', name: 'Dir', login: 'adm.a', password: 'court' } })).status, 400)
-  const reg = await ok('POST', '/auth/register', { body: { school: 'Lycée A', name: 'Directeur', login: 'adm.a', password: 'motdepasse1' } })
+  const reg = await ok('POST', '/auth/register', { body: { school: 'Lycée A', name: 'Directeur', login: 'adm.a', password: 'motdepasse1', license: await lic() } })
   assert.equal(reg.user.role, 'admin'); assert.equal(reg.school.name, 'Lycée A')
   assert.equal(reg.user.hash, undefined, 'le hash ne sort jamais')
-  assert.equal((await call('POST', '/auth/register', { body: { school: 'X', name: 'Y', login: 'ADM.A', password: 'motdepasse1' } })).status, 409, 'identifiant unique sans tenir compte de la casse')
+  assert.equal((await call('POST', '/auth/register', { body: { school: 'X', name: 'Y', login: 'ADM.A', password: 'motdepasse1', license: await lic() } })).status, 409, 'identifiant unique sans tenir compte de la casse')
   S.admin = reg.token
   assert.equal((await call('POST', '/auth/login', { body: { login: 'adm.a', password: 'faux' } })).status, 401)
   assert.ok((await ok('POST', '/auth/login', { body: { login: 'ADM.A', password: 'motdepasse1' } })).token)
@@ -102,6 +107,22 @@ test('l’administration enregistre les élèves ; les enseignants les trouvent 
   assert.deepEqual(r, { added: 3, skipped: 1 })
   // le personnel administratif peut aussi enregistrer
   assert.deepEqual(await ok('POST', `/classes/${S.cl}/eleves`, { token: S.staff, body: { names: ['DIALLO Seydou'] } }), { added: 1, skipped: 0 })
+  // fiches complètes (import Excel / CSV / PDF) et lignes collées étendues ; ce qui est illisible devient vide sans bloquer l'import
+  const lot = await ok('POST', `/classes/${S.cl}/eleves`, { token: S.admin, body: {
+    students: [
+      { name: 'LOT Un', matricule: 'L1', sex: 'Fille', birthDate: '14/05/2012', birthPlace: 'Bobo-Dioulasso', parentName: 'M. Lot', parentPhone: '70 11 22 33', repeater: 'oui', parentRelation: 'pere' },
+      { name: 'LOT Deux', sex: '?', birthDate: '31/02/2012', parentPhone: 'abc<script>', parentEmail: 'pas-un-mail' },
+      { name: 'LOT Un' },
+    ],
+    names: ['LOT Trois ; L3 ; M ; 2011-09-01 ; Koudougou ; Mme Lot ; 76 00 00 00'] } })
+  assert.deepEqual(lot, { added: 3, skipped: 1 })
+  const lots = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves
+  const l1 = lots.find(e => e.name === 'LOT Un'), l2 = lots.find(e => e.name === 'LOT Deux'), l3 = lots.find(e => e.name === 'LOT Trois')
+  assert.deepEqual([l1.sex, l1.birthDate, l1.birthPlace, l1.parentPhone, l1.repeater, l1.parentRelation], ['F', '2012-05-14', 'Bobo-Dioulasso', '70 11 22 33', true, 'pere'])
+  assert.deepEqual([l2.sex, l2.birthDate, l2.parentPhone, l2.parentEmail], ['', '', '', ''], 'valeurs illisibles : vides, sans erreur')
+  assert.deepEqual([l3.sex, l3.birthDate, l3.birthPlace, l3.parentName, l3.parentPhone, l3.matricule], ['M', '2011-09-01', 'Koudougou', 'Mme Lot', '76 00 00 00', 'L3'])
+  assert.equal((await call('POST', `/classes/${S.cl}/eleves`, { token: S.admin, body: {} })).status, 400)
+  for (const x of lots.filter(e => e.name.startsWith('LOT '))) await ok('DELETE', `/eleves/${x.id}`, { token: S.admin })
   // les enseignants ne peuvent ni ajouter, ni modifier, ni supprimer — même dans leur propre classe
   for (const t of [S.t1, S.t2, S.t3]) assert.equal((await call('POST', `/classes/${S.cl}/eleves`, { token: t, body: { names: ['X Y'] } })).status, 403)
   const el = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves
@@ -245,7 +266,7 @@ test('vie scolaire : retards, comportement, pénalités avec motif — droits pa
   assert.equal((await call('DELETE', `/incidents/${pen.body.id}`, { token: S.t2 })).status, 200)
   assert.equal((await call('DELETE', `/incidents/${pen.body.id}`, { token: S.admin })).status, 404)
   // un autre établissement ne voit rien
-  const other = await ok('POST', '/auth/register', { body: { school: 'Lycée C', name: 'Dir C', login: 'adm.c', password: 'motdepasse3' } })
+  const other = await ok('POST', '/auth/register', { body: { school: 'Lycée C', name: 'Dir C', login: 'adm.c', password: 'motdepasse3', license: await lic() } })
   assert.equal((await post(other.token, { tr: 0, type: 'retard', minutes: 5 })).status, 404)
   // la suppression d'un élève emporte ses signalements
   const tmp = (await ok('POST', `/classes/${S.cl}/eleves`, { token: S.admin, body: { names: ['TEMP Vie'] } }))
@@ -295,7 +316,7 @@ test('sécurité : jetons, mots de passe, limites de débit, aucun secret en sor
   // limites de débit
   process.env.REGISTER_LIMIT = '0'
   assert.equal((await reg({ school: 'Robot', name: 'R', login: 'robot.un', password: 'motdepasse77' })).status, 429, 'création d’établissements limitée')
-  delete process.env.REGISTER_LIMIT
+  process.env.REGISTER_LIMIT = '1000'
   process.env.RATE_LIMIT = '1'
   assert.equal((await call('GET', '/health')).status, 429, 'limite globale par adresse')
   process.env.RATE_LIMIT = '100000'
@@ -433,6 +454,22 @@ test('inscription : dossier, parent, effectif maximum', async () => {
   assert.deepEqual([el.status, el.parentName, el.parentPhone], ['enrolled', 'M. Ouédraogo', '70 12 34 56'])
   assert.equal((await ok('GET', `/classes/${S.cl}/full`, { token: S.t1 })).eleves.find(e => e.id === S.e3).parentPhone, undefined, 'coordonnées parents : administration seulement')
   assert.equal((await call('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'OUEDRAOGO Salif', parentPhone: '70123456' } })).status, 409, 'doublon refusé')
+  // fiche d'identité complète
+  const fiche = await ok('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: {
+    name: 'FICHE Complete', parentPhone: '70123456', parentPhone2: '76 11 22 33', parentRelation: 'mere', parentName: 'Mme Fiche',
+    sex: 'F', birthDate: '2012-05-14', birthPlace: 'Ouagadougou', nationality: 'Burkinabè', address: 'Secteur 15, Bogodogo', previousSchool: 'École Wemtenga', repeater: true, health: 'Allergie à la pénicilline' } })
+  const fcl = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.find(e => e.id === fiche.id)
+  assert.deepEqual([fcl.sex, fcl.birthDate, fcl.birthPlace, fcl.repeater, fcl.parentRelation, fcl.parentPhone2, fcl.previousSchool, fcl.health],
+    ['F', '2012-05-14', 'Ouagadougou', true, 'mere', '76 11 22 33', 'École Wemtenga', 'Allergie à la pénicilline'])
+  assert.equal((await ok('GET', `/classes/${S.cl}/full`, { token: S.t1 })).eleves.find(e => e.id === fiche.id).health, undefined, 'fiche personnelle : administration seulement')
+  for (const bad of [{ sex: 'X' }, { birthDate: '2999-01-01' }, { birthDate: '14/05/2012' }, { parentRelation: 'oncle' }, { parentPhone2: '12' }])
+    assert.equal((await call('PUT', `/eleves/${fiche.id}`, { token: S.staff, body: bad })).status, 400, JSON.stringify(bad))
+  await ok('PUT', `/eleves/${fiche.id}`, { token: S.staff, body: { birthDate: '2012-06-01', sex: 'M', health: '' } })
+  const maj = (await ok('GET', `/classes/${S.cl}/full`, { token: S.admin })).eleves.find(e => e.id === fiche.id)
+  assert.deepEqual([maj.birthDate, maj.sex, maj.health], ['2012-06-01', 'M', ''])
+  const trace = (await ok('GET', '/audit?action=eleve_modifie', { token: S.admin }))[0]
+  assert.deepEqual(trace.detail.changes.birthDate, ['2012-05-14', '2012-06-01'], 'modification de la fiche tracée')
+  await ok('PUT', `/eleves/${fiche.id}`, { token: S.staff, body: { status: 'withdrawn' } })   // ne compte plus dans l'effectif ci-dessous
   // effectif maximum
   const base = { capacity: 4, inscription: 10000, scolarite: 90000, modalite: 'trimestriel' }
   await ok('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: base })
@@ -441,7 +478,7 @@ test('inscription : dossier, parent, effectif maximum', async () => {
   await ok('POST', `/classes/${S.cl}/inscriptions`, { token: S.staff, body: { name: 'PLACE Libre', status: 'pending', parentPhone: '70123456' } })
   const ov = await ok('GET', '/inscriptions', { token: S.staff })
   const c = ov.classes.find(x => x.id === S.cl)
-  assert.deepEqual([c.enrolled, c.pending, c.withdrawn, c.capacity, c.free], [3, 1, 1, 4, 0])
+  assert.deepEqual([c.enrolled, c.pending, c.withdrawn, c.capacity, c.free], [3, 1, 2, 4, 0])
   await ok('PUT', `/classes/${S.cl}/finance`, { token: S.admin, body: { ...base, capacity: 0 } })
 })
 
@@ -573,8 +610,109 @@ test('années scolaires : l’année réelle reste valide, on peut préparer la 
   assert.equal((await ok('GET', '/messages', { token: S.admin })).length >= 3, true, 'les messages suivent l’année')
 })
 
+test('licences : création d’établissement sur code, expiration, renouvellement, limite d’élèves, contrôle du propriétaire', async () => {
+  const reg = (login, license) => call('POST', '/auth/register', { body: { school: 'Lycée ' + login, name: 'Dir', login, password: 'motdepasse9', license } })
+  // étape 1 : le code est vérifié AVANT le formulaire, sans être consommé
+  const check = code => call('POST', '/licence/verifier', { body: { code } })
+  const pre = await lic({ days: 45, maxStudents: 7 })
+  const good = await check(pre)
+  assert.deepEqual([good.status, good.body.valid, good.body.days, good.body.maxStudents], [200, true, 45, 7])
+  assert.deepEqual(Object.keys(good.body).sort(), ['days', 'maxStudents', 'valid'], 'rien d’autre que la durée et la limite')
+  assert.equal((await check(pre.toLowerCase().replace(/-/g, ' '))).status, 200, 'saisie tolérante')
+  assert.equal((await check('EDV-AAAA-BBBB-CCCC-DDDD')).status, 400, 'code inconnu')
+  assert.equal((await check('')).status, 400)
+  const ann = await lic({ status: 'revoked' })
+  assert.equal((await check(ann)).status, 400, 'code annulé')
+  assert.equal((await check(pre)).status, 200, 'vérifier ne consomme pas le code')
+  const first = await reg('etape.lic', pre)
+  assert.equal(first.status, 201)
+  assert.equal((await check(pre)).status, 400, 'une fois utilisé, le code ne passe plus la vérification')
+
+  // pas de code, mauvais code : aucun établissement créé
+  assert.equal((await reg('lic.un', undefined)).status, 400, 'code obligatoire')
+  const wrong = await reg('lic.deux', 'EDV-AAAA-BBBB-CCCC-DDDD')
+  assert.equal(wrong.status, 400); assert.match(wrong.body.error, /invalide|utilisé|annulé/)
+  assert.equal(await mongoose.models.School.countDocuments({ name: /Lycée lic\./ }), 0)
+
+  // un code = un seul établissement ; saisie tolérante (minuscules, sans tirets)
+  const c1 = await lic({ days: 30, maxStudents: 2, note: 'Test limite' })
+  const ok1 = await reg('lic.trois', c1.toLowerCase().replace(/-/g, ' '))
+  assert.equal(ok1.status, 201)
+  const exp = new Date(ok1.body.school.licenseExpires).getTime()
+  assert.ok(Math.abs(exp - (Date.now() + 30 * 86400000)) < 120000, 'la durée démarre à l’activation')
+  assert.equal(ok1.body.school.maxStudents, 2); assert.equal(ok1.body.school.licenseCode, undefined, 'le code n’est jamais renvoyé')
+  assert.equal((await reg('lic.quatre', c1)).status, 400, 'code déjà utilisé')
+  const adm = ok1.body.token
+  assert.equal(await mongoose.models.School.countDocuments({ name: 'Lycée lic.quatre' }), 0)
+
+  // limite d'élèves de la licence
+  const cl = (await ok('POST', '/classes', { token: adm, body: { name: '6è' } })).id
+  assert.deepEqual(await ok('POST', `/classes/${cl}/eleves`, { token: adm, body: { names: ['A UN', 'B DEUX'] } }), { added: 2, skipped: 0 })
+  const over = await call('POST', `/classes/${cl}/eleves`, { token: adm, body: { names: ['C TROIS'] } })
+  assert.equal(over.status, 403); assert.match(over.body.error, /Limite de la licence/)
+  assert.equal((await call('POST', `/classes/${cl}/inscriptions`, { token: adm, body: { name: 'D QUATRE', parentPhone: '70123456' } })).status, 403)
+  const st = await ok('GET', '/licence', { token: adm })
+  assert.deepEqual([st.valid, st.students, st.maxStudents], [true, 2, 2])
+
+  // expiration : tout est verrouillé (402) sauf l'état de la licence et le renouvellement
+  const School = mongoose.models.School
+  const sid = ok1.body.school.id
+  await School.updateOne({ _id: sid }, { $set: { licenseExpires: new Date(Date.now() - 1000) } })
+  for (const [m, p] of [['GET', '/classes'], ['GET', `/classes/${cl}/full`], ['GET', '/users'], ['GET', '/audit']]) {
+    const r = await call(m, p, { token: adm })
+    assert.equal(r.status, 402, `${p} verrouillé`); assert.match(r.body.error, /Licence expirée/)
+  }
+  assert.equal((await call('GET', '/me', { token: adm })).status, 200, 'on peut toujours savoir où on en est')
+  assert.equal((await ok('GET', '/licence', { token: adm })).valid, false)
+  assert.equal((await call('POST', '/auth/login', { body: { login: 'lic.trois', password: 'motdepasse9' } })).status, 200, 'la connexion reste possible pour renouveler')
+  // renouvellement : mauvais code, code déjà utilisé, puis bon code
+  assert.equal((await call('POST', '/licence/renew', { token: adm, body: { code: 'EDV-ZZZZ-ZZZZ-ZZZZ-ZZZZ' } })).status, 400)
+  assert.equal((await call('POST', '/licence/renew', { token: adm, body: { code: c1 } })).status, 400, 'ancien code déjà utilisé')
+  const c2 = await lic({ days: 100, maxStudents: 50 })
+  const renewed = await ok('POST', '/licence/renew', { token: adm, body: { code: c2 } })
+  assert.ok(Math.abs(new Date(renewed.licenseExpires).getTime() - (Date.now() + 100 * 86400000)) < 120000, 'expirée : la durée repart d’aujourd’hui')
+  assert.equal(renewed.maxStudents, 50)
+  assert.equal((await call('GET', '/classes', { token: adm })).status, 200, 'déverrouillé')
+  // renouveler AVANT l'expiration ajoute la durée à ce qui reste
+  const c3 = await lic({ days: 10 })
+  const again = await ok('POST', '/licence/renew', { token: adm, body: { code: c3 } })
+  assert.ok(Math.abs(new Date(again.licenseExpires).getTime() - (Date.now() + 110 * 86400000)) < 120000, 'la durée s’additionne')
+  // seul l'administrateur renouvelle
+  const t = await ok('POST', '/users', { token: adm, body: { login: 'lic.prof', name: 'Prof', role: 'teacher', password: 'provisoire1' } })
+  const tok = (await ok('POST', '/auth/login', { body: { login: 'lic.prof', password: 'provisoire1' } })).token
+  assert.equal((await call('POST', '/licence/renew', { token: tok, body: { code: await lic() } })).status, 403)
+
+  // propriétaire : clé secrète obligatoire, création, annulation immédiate, rétablissement, prolongation
+  const owner = (m, p, body, key = process.env.OWNER_KEY) => fetch(base + p, { method: m, headers: { 'content-type': 'application/json', ...(key ? { 'x-owner-key': key } : {}) }, body: body && JSON.stringify(body) }).then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }))
+  assert.equal((await owner('GET', '/owner/licences', undefined, 'mauvaise-cle-mauvaise-cle-123')).status, 401)
+  assert.equal((await owner('GET', '/owner/licences', undefined, null)).status, 401)
+  assert.equal((await call('GET', '/owner/licences', { token: adm })).status, 401, 'un administrateur d’école n’est pas le propriétaire')
+  const made = await owner('POST', '/owner/licences', { days: 90, maxStudents: 300, note: 'Lycée Test', count: 2 })
+  assert.equal(made.status, 201); assert.equal(made.body.length, 2); assert.match(made.body[0].code, /^EDV-[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/)
+  assert.equal((await owner('POST', '/owner/licences', { days: 0 })).status, 400)
+  const listed = (await owner('GET', '/owner/licences')).body
+  assert.equal(listed.find(l => l.code === c2).school.name, 'Lycée lic.trois'); assert.equal(listed.find(l => l.code === made.body[0].code).state, 'libre')
+  assert.equal((await call('GET', '/classes', { token: adm })).status, 200)
+  await owner('POST', `/owner/licences/${c3}/revoke`)   // c3 = la licence en cours de l'établissement
+  const cut = await call('GET', '/classes', { token: adm })
+  assert.equal(cut.status, 402); assert.match(cut.body.error, /suspendue/)
+  const c4 = await lic()
+  await owner('POST', `/owner/licences/${c4}/revoke`)
+  assert.equal((await reg('lic.cinq', c4)).status, 400, 'un code annulé ne peut plus créer d’établissement')
+  await owner('POST', `/owner/licences/${c3}/restore`)
+  assert.equal((await call('GET', '/classes', { token: adm })).status, 200)
+  const before = new Date((await ok('GET', '/licence', { token: adm })).expires).getTime()
+  await owner('POST', `/owner/licences/${c2}/extend`, { days: 30 })
+  assert.ok(Math.abs(new Date((await ok('GET', '/licence', { token: adm })).expires).getTime() - (before + 30 * 86400000)) < 5000, 'prolongation')
+  // sans OWNER_KEY configurée, l'interface propriétaire n'existe pas
+  const keep = process.env.OWNER_KEY
+  delete process.env.OWNER_KEY
+  assert.equal((await owner('GET', '/owner/licences', undefined, keep)).status, 404)
+  process.env.OWNER_KEY = keep
+})
+
 test('isolation entre établissements', async () => {
-  const b = await ok('POST', '/auth/register', { body: { school: 'Lycée B', name: 'Dir B', login: 'adm.b', password: 'motdepasse2' } })
+  const b = await ok('POST', '/auth/register', { body: { school: 'Lycée B', name: 'Dir B', login: 'adm.b', password: 'motdepasse2', license: await lic() } })
   assert.equal((await call('GET', `/classes/${S.cl}/full`, { token: b.token })).status, 404)
   assert.equal((await call('PUT', '/notes', { token: b.token, body: { eleveId: S.e1, matiereId: S.maths, tr: 0, k: 0, value: '1' } })).status, 404)
   assert.equal((await call('PUT', `/users/${S.t1id}`, { token: b.token, body: { active: false } })).status, 404)

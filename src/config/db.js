@@ -24,6 +24,8 @@ async function migrate() {
   for (const s of await School.find({ $or: [{ annees: { $exists: false } }, { annees: { $size: 0 } }] })) {
     s.annees = [s.annee]; await s.save()
   }
+  // établissements créés avant les licences : 90 jours d'accès pour se mettre en règle
+  await School.updateMany({ licenseExpires: { $exists: false } }, { $set: { licenseExpires: new Date(Date.now() + 90 * 86_400_000), licenseStatus: 'active' } })
   // référence publique des élèves déjà enregistrés
   const { Eleve } = mongoose.models
   const sans = await Eleve.find({ ref: { $exists: false } }).select('_id').lean()

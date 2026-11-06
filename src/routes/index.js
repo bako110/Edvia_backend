@@ -13,11 +13,12 @@ import messages from './message.routes.js'
 import devoirs from './devoir.routes.js'
 import auditRoutes from './audit.routes.js'
 import verify from './verify.routes.js'
+import licence from './license.routes.js'
 import { notFoundApi } from '../middlewares/error.js'
 
 // Toutes les routes de l'API (montées sous /api)
 const api = Router()
-api.use(auth, school, users, classes, eleves, notes, incidents, inscriptions, finance, timetable, messages, devoirs, auditRoutes, verify)
+api.use(auth, school, users, classes, eleves, notes, incidents, inscriptions, finance, timetable, messages, devoirs, auditRoutes, verify, licence)
 // Contrôle de santé (hébergeur) : répond 200 sans authentification
 api.get('/health', (req, res) => res.json({ ok: true }))
 api.use(notFoundApi)

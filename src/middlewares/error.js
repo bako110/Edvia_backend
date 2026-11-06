@@ -13,7 +13,7 @@ const DUPLICATES = [
 // Gestionnaire d'erreurs central : tout `throw` des couches inférieures arrive ici
 // eslint-disable-next-line no-unused-vars
 export function errorHandler(err, req, res, next) {
-  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message })
+  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...(err.code ? { code: err.code } : {}) })
   if (err.code === 11000) {
     const keys = Object.keys(err.keyPattern || {})
     const hit = DUPLICATES.find(([k]) => keys.includes(k))

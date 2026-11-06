@@ -1,7 +1,8 @@
 import jwt from 'jsonwebtoken'
 import { config } from '../config/env.js'
 import { School, User } from '../models/index.js'
-import { conflict, badRequest, forbidden, unauthorized } from '../utils/errors.js'
+import { conflict, badRequest, forbidden, unauthorized, HttpError } from '../utils/errors.js'
+import { licenseValid } from '../utils/licenseState.js'
 import { makeLimiter } from '../utils/loginLimiter.js'
 import mongoose from 'mongoose'
 import { claim, applyTo, release } from './license.service.js'
@@ -46,7 +47,11 @@ export async function login(ip, { login, password }) {
   }
   if (!user.active) throw forbidden('Ce compte est désactivé. Contactez l’administrateur.')
   limiter.reset(key); accountLimiter.reset(login)
-  return session(user, await School.findById(user.school))
+  const school = await School.findById(user.school)
+  if (!licenseValid(school) && user.role !== 'admin') {
+    throw new HttpError(403, school.licenseStatus === 'revoked' ? 'Licence suspendue : l’accès de votre établissement est suspendu. Prévenez l’administrateur.' : 'Licence expirée : l’accès de votre établissement est suspendu. Prévenez l’administrateur.', 'license')
+  }
+  return session(user, school)
 }
 
 export async function me(user) {

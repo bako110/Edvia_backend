@@ -3,7 +3,7 @@ import { config } from '../config/env.js'
 import { School, User } from '../models/index.js'
 import { isArchiveYear } from '../utils/year.js'
 import { licenseValid } from '../utils/licenseState.js'
-import { unauthorized, forbidden, paymentRequired } from '../utils/errors.js'
+import { unauthorized, forbidden, paymentRequired, licenseLogout } from '../utils/errors.js'
 
 // seules routes ouvertes quand la licence est expirée ou annulée : savoir où on en est, et la renouveler
 const LICENSE_OPEN = ['/api/me', '/api/licence']
@@ -19,8 +19,14 @@ export async function authenticate(req, res, next) {
   if (payload.tv !== (user.tokenVersion || 0)) throw unauthorized('Session expirée, reconnectez-vous')   // mot de passe, rôle ou statut modifié depuis
   // année scolaire affichée à tous (choisie par l'administrateur) ; seules les années TERMINÉES sont en consultation seule pour les enseignants
   const school = await School.findById(user.school).select('annee annees licenseExpires licenseStatus')
-  if (!licenseValid(school) && !LICENSE_OPEN.some(p => req.originalUrl.startsWith(p))) {
-    throw paymentRequired(school.licenseStatus === 'revoked' ? 'Licence suspendue : contactez EDVIA.' : 'Licence expirée : l’administrateur doit la renouveler avec un nouveau code.')
+  if (!licenseValid(school)) {
+    const revoked = school.licenseStatus === 'revoked'
+    // enseignants et personnel : session refusée partout (même /me), l'interface les déconnecte tout de suite
+    if (user.role !== 'admin') throw licenseLogout(revoked ? 'Licence suspendue : l’accès de votre établissement est suspendu. Prévenez l’administrateur.' : 'Licence expirée : l’accès de votre établissement est suspendu. Prévenez l’administrateur.')
+    // administrateur : il garde la main pour savoir où en est la licence et la renouveler, rien d'autre
+    if (!LICENSE_OPEN.some(p => req.originalUrl.startsWith(p))) {
+      throw paymentRequired(revoked ? 'Licence suspendue : contactez EDVIA.' : 'Licence expirée : renouvelez-la avec un nouveau code.')
+    }
   }
   user.annee = school.annee
   user.ip = req.ip
